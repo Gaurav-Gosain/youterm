@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net/url"
@@ -19,7 +20,7 @@ func main() {
 	count := flag.Int("n", 10, "number of search results")
 	useMpv := flag.Bool("mpv", false, "use mpv backend instead of native player")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, `Usage: youterm [options] <youtube-url or search query>
+		fmt.Fprintf(os.Stderr, `Usage: youterm [options] [youtube-url or search query]
 
 Plays YouTube videos in kitty terminal using the kitty graphics protocol.
 Requires: ffmpeg, ffplay, yt-dlp, kitty terminal
@@ -36,67 +37,72 @@ Controls:
 	}
 	flag.Parse()
 
-	if flag.NArg() < 1 {
-		flag.Usage()
-		os.Exit(1)
-	}
-
 	query := strings.Join(flag.Args(), " ")
 
-	var videoURL, title string
-	var duration float64
+	for {
+		var videoURL, title string
+		var duration float64
 
-	if isURL(query) {
-		videoURL = query
-		if !*useMpv {
-			fmt.Fprintf(os.Stderr, "Resolving metadata...\n")
-			info, err := ytdlp.GetMetadata(query)
-			if err == nil {
-				title = info.Title
-				duration = info.Duration
+		if query != "" && isURL(query) {
+			// Direct URL mode
+			videoURL = query
+			if !*useMpv {
+				fmt.Fprintf(os.Stderr, "Resolving metadata...\n")
+				info, err := ytdlp.GetMetadata(query)
+				if err == nil {
+					title = info.Title
+					duration = info.Duration
+				}
 			}
-		}
-	} else {
-		fmt.Fprintf(os.Stderr, "Searching...\n")
-		results, err := ytdlp.Search(query, *count)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Search error: %v\n", err)
-			os.Exit(1)
-		}
-		if len(results) == 0 {
-			fmt.Fprintln(os.Stderr, "No results found.")
-			os.Exit(1)
+		} else {
+			// Search mode: pass initial results if we have a query, otherwise empty
+			var initialResults []ytdlp.Result
+			if query != "" {
+				fmt.Fprintf(os.Stderr, "Searching...\n")
+				results, err := ytdlp.Search(query, *count)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Search error: %v\n", err)
+					os.Exit(1)
+				}
+				initialResults = results
+			}
+
+			chosen, err := ui.Pick(initialResults, *count)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			if chosen == nil || chosen.URL == "" {
+				return
+			}
+
+			videoURL = chosen.URL
+			title = chosen.Title
+			duration = chosen.Duration
 		}
 
-		chosen, err := ui.Pick(results)
+		var err error
+		if *useMpv {
+			err = mpv.Play(videoURL, *quality)
+		} else {
+			err = player.Run(player.Config{
+				URL:       videoURL,
+				Title:     title,
+				Duration:  duration,
+				MaxHeight: *quality,
+				FPS:       *fps,
+			})
+		}
+
+		if errors.Is(err, player.ErrBackToSearch) {
+			query = "" // go to picker with empty search bar
+			continue
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		if chosen == nil {
-			return
-		}
-
-		videoURL = chosen.URL
-		title = chosen.Title
-		duration = chosen.Duration
-	}
-
-	var err error
-	if *useMpv {
-		err = mpv.Play(videoURL, *quality)
-	} else {
-		err = player.Run(player.Config{
-			URL:       videoURL,
-			Title:     title,
-			Duration:  duration,
-			MaxHeight: *quality,
-			FPS:       *fps,
-		})
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return
 	}
 }
 
