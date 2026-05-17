@@ -1,6 +1,6 @@
 <div align="center">
   <h1>youterm</h1>
-  <p>Play YouTube videos directly in your terminal using the kitty graphics protocol.</p>
+  <p>Play YouTube videos in your terminal using the kitty graphics protocol.</p>
 
   <a href="https://github.com/Gaurav-Gosain/youterm/releases"><img src="https://img.shields.io/github/release/Gaurav-Gosain/youterm.svg" alt="Latest Release"></a>
   <a href="https://pkg.go.dev/github.com/Gaurav-Gosain/youterm?tab=doc"><img src="https://godoc.org/github.com/Gaurav-Gosain/youterm?status.svg" alt="GoDoc"></a>
@@ -9,7 +9,7 @@
 
 ---
 
-youterm streams and plays YouTube videos natively in terminals that support the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/). Search for videos or paste a URL, pick a result from the interactive TUI, and watch it right in your terminal with synchronized audio.
+youterm streams YouTube videos in terminals that support the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/). It pairs an interactive TUI picker with a native renderer: thumbnail-driven search, mouse-driven seek bar with buffer indicator, on-the-fly quality switching, and synchronized audio via the platform's native sound API.
 
 <details>
 <summary>Table of Contents</summary>
@@ -25,37 +25,45 @@ youterm streams and plays YouTube videos natively in terminals that support the 
 
 ## Installation
 
-### Quick Install
+### Go Install
 
-**Go Install:**
 ```bash
 go install github.com/Gaurav-Gosain/youterm/cmd/youterm@latest
 ```
 
 ### Other Methods
 
-- **[GitHub Releases](https://github.com/Gaurav-Gosain/youterm/releases)** - Download pre-built binaries
-- **Build from Source:** See [Development](#development) below
+- **[GitHub Releases](https://github.com/Gaurav-Gosain/youterm/releases)** - pre-built binaries
+- **Build from source:** see [Development](#development)
 
-**Requirements:**
-- A terminal with kitty graphics protocol support ([kitty](https://sw.kovidgoyal.net/kitty/), [Ghostty](https://ghostty.org/), etc.)
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp)
-- [ffmpeg](https://ffmpeg.org/) & ffplay
-- Optional: [mpv](https://mpv.io/) (for `--mpv` mode)
+### Prerequisites
+
+- A terminal with kitty graphics support: [kitty](https://sw.kovidgoyal.net/kitty/), [Ghostty](https://ghostty.org/), [WezTerm](https://wezfurlong.org/wezterm/)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) on `PATH` (stream resolution)
+- [ffmpeg](https://ffmpeg.org/) on `PATH` (decoding)
+- Audio backend (auto-detected via [oto](https://github.com/ebitengine/oto)):
+  - Linux: ALSA or PulseAudio
+  - macOS: CoreAudio (built in)
+- Optional: [mpv](https://mpv.io/) for the `--mpv` fallback renderer
+
+Currently supported platforms: **Linux**, **macOS**. Windows requires extra work and is not supported yet.
 
 ## Usage
 
 ```bash
+# Open the picker (no args)
+youterm
+
 # Search and play
 youterm lofi hip hop
 
 # Play a direct URL
 youterm https://www.youtube.com/watch?v=dQw4w9WgXcQ
 
-# Custom quality and frame rate
+# Pick a target resolution and frame rate
 youterm -q 720 -fps 60 "never gonna give you up"
 
-# Use mpv backend instead of native player
+# Use mpv backend instead of the native renderer
 youterm --mpv https://www.youtube.com/watch?v=dQw4w9WgXcQ
 ```
 
@@ -66,47 +74,57 @@ youterm --mpv https://www.youtube.com/watch?v=dQw4w9WgXcQ
 | `-q` | `480` | Max video height (360, 480, 720, 1080) |
 | `-fps` | `30` | Target frame rate |
 | `-n` | `10` | Number of search results |
-| `-mpv` | `false` | Use mpv backend instead of native player |
+| `-mpv` | `false` | Use mpv backend instead of native renderer |
 
 ## Features
 
-- **Native terminal rendering** using the kitty graphics protocol with zero-copy frame delivery via shared memory
-- **Interactive search** with a scrollable TUI picker powered by Bubble Tea
-- **Audio/video sync** with automatic frame skipping to maintain sync
-- **Synchronized output** for tear-free rendering
-- **Dynamic resizing** that adapts to terminal size changes
-- **Seeking** with keyboard shortcuts (5s, 10s, 30s, 60s jumps)
-- **Pause/resume** support
-- **mpv fallback** for terminals without kitty graphics support
+- **Native terminal rendering** via kitty graphics, zero-copy through an mmap'd frame buffer
+- **Async decoder** with a 150-frame ring buffer for buffer-ahead playback
+- **Native audio** through CoreAudio / ALSA / PulseAudio via [oto](https://github.com/ebitengine/oto) (no external audio process)
+- **Interactive picker** with integrated search bar and thumbnail previews
+- **YouTube-style seek bar** with red played portion, dim buffered portion, and a position dot
+- **Mouse support:** click on video to pause, click and drag on the seek bar to scrub, scroll wheel to seek
+- **In-buffer seek** skips frames instead of re-downloading when seeking forward within the buffer
+- **On-the-fly quality switching** (1-4 keys) with seamless restart at the current position
+- **Loop** mode, **mute**, **back to search** from the player
+- **Aspect-ratio aware** for portrait videos and Shorts
 
 ## Controls
+
+### Picker
+
+| Key | Action |
+|-----|--------|
+| Type | Search YouTube |
+| `Enter` | Run search / play selected |
+| `j` / `k` / arrows | Navigate results |
+| `g` / `G` | Top / bottom |
+| `/` | Focus search bar |
+| `Esc` | Back from search to results, or quit |
+| `q` / `Ctrl-C` | Quit |
 
 ### Player
 
 | Key | Action |
 |-----|--------|
-| `Space` | Pause / Resume |
+| `Space` | Pause / resume |
+| Click on video | Pause / resume |
 | `Left` / `Right` | Seek -5s / +5s |
 | `h` / `l` | Seek -10s / +10s |
-| `Down` / `Up` | Seek -30s / +30s |
+| `Up` / `Down` | Seek +30s / -30s |
 | `j` / `k` | Seek -60s / +60s |
-| `q` | Quit |
-
-### Search Picker
-
-| Key | Action |
-|-----|--------|
-| `j` / `Down` | Move cursor down |
-| `k` / `Up` | Move cursor up |
-| `g` / `G` | Go to top / bottom |
-| `Enter` | Play selected video |
-| `q` / `Esc` | Quit |
+| Scroll wheel | Seek -5s / +5s |
+| Click + drag bar | Scrub preview, seek on release |
+| `m` | Mute / unmute |
+| `r` | Toggle loop |
+| `1` / `2` / `3` / `4` | Switch quality (360p / 480p / 720p / 1080p) |
+| `/` | Back to search |
+| `q` / `Ctrl-C` | Quit |
 
 ## Development
 
-Contributions are welcome. Feel free to open issues or pull requests.
+Contributions welcome. Open issues or pull requests.
 
-**Build from source:**
 ```bash
 git clone https://github.com/Gaurav-Gosain/youterm.git
 cd youterm
@@ -134,4 +152,4 @@ go build -o youterm ./cmd/youterm
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+MIT. See [LICENSE](LICENSE).

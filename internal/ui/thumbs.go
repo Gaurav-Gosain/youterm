@@ -9,7 +9,6 @@ import (
 	"time"
 )
 
-// thumb holds a decoded YouTube thumbnail prepared for kitty graphics.
 type thumb struct {
 	path    string
 	pathB64 string
@@ -70,9 +69,8 @@ func thumbTmpDir() string {
 	return os.TempDir()
 }
 
-// displayCmd returns the escape sequence that transmits and displays
-// the thumbnail at the current cursor position in one step (a=T).
-// C=1 keeps the cursor where it is so callers can draw text alongside.
+// displayCmd transmits and displays the thumbnail at the cursor with C=1
+// so the cursor stays put for callers to draw text beside it.
 func (t *thumb) displayCmd(cols, rows int) string {
 	return fmt.Sprintf("\x1b_Ga=T,t=f,f=24,s=%d,v=%d,c=%d,r=%d,C=1,q=2;%s\x1b\\",
 		t.w, t.h, cols, rows, t.pathB64)

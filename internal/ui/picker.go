@@ -37,17 +37,17 @@ type pickerState struct {
 	tty *os.File
 	fd  int
 
-	results    []ytdlp.Result
-	thumbs     []*thumb
-	mu         sync.Mutex
-	thumbDone  chan struct{}
+	results     []ytdlp.Result
+	thumbs      []*thumb
+	mu          sync.Mutex
+	thumbDone   chan struct{}
 	searchCount int
 
 	cursor  int
 	offset  int
-	input   []byte   // search bar text
-	editing bool     // true when search bar is focused
-	loading bool     // true while searching
+	input   []byte
+	editing bool
+	loading bool
 
 	redrawCh chan struct{}
 }
@@ -86,7 +86,6 @@ func (ps *pickerState) startThumbDownloads() {
 			}
 		}(i, r.ID)
 	}
-	// Close channel when all downloads finish so the forwarder exits
 	go func() { wg.Wait(); close(done) }()
 
 	go func() {
@@ -114,7 +113,7 @@ func (ps *pickerState) doSearch() {
 		ps.thumbs = nil
 		ps.cursor = 0
 		ps.offset = 0
-		ps.editing = true // go back to search bar
+		ps.editing = true
 		ps.redraw()
 		return
 	}
@@ -126,10 +125,8 @@ func (ps *pickerState) doSearch() {
 	ps.redraw()
 }
 
-// Pick presents an interactive picker with an integrated search bar.
-// If initialResults is non-empty, it shows those results immediately.
-// Otherwise it starts in search mode. searchCount controls how many
-// results yt-dlp returns.
+// Pick shows an interactive picker. If initialResults is empty, it starts
+// in search-input mode. searchCount sets the yt-dlp result limit.
 func Pick(initialResults []ytdlp.Result, searchCount int) (*ytdlp.Result, error) {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
@@ -158,7 +155,6 @@ func Pick(initialResults []ytdlp.Result, searchCount int) (*ytdlp.Result, error)
 		redrawCh:    make(chan struct{}, 1),
 	}
 
-	// Cleanup thumbs on exit
 	defer func() {
 		ps.mu.Lock()
 		for _, t := range ps.thumbs {
@@ -182,7 +178,6 @@ func Pick(initialResults []ytdlp.Result, searchCount int) (*ytdlp.Result, error)
 		}
 	}()
 
-	// Key input
 	keyCh := make(chan []byte, 4)
 	stopKeys := make(chan struct{})
 	go func() {
@@ -229,43 +224,39 @@ func Pick(initialResults []ytdlp.Result, searchCount int) (*ytdlp.Result, error)
 	}
 }
 
-// handleSearchInput handles keys when the search bar is focused.
-// Returns non-nil result only on quit (returns nil, signaling abort).
+// handleSearchInput returns non-nil to signal exit (empty Result aborts).
 func handleSearchInput(ps *pickerState, key []byte) *ytdlp.Result {
 	switch {
-	case key[0] == 3: // ctrl-c
-		return &ytdlp.Result{} // sentinel for quit (checked below)
+	case key[0] == 3:
+		return &ytdlp.Result{}
 	case key[0] == 0x1b:
 		if len(key) == 1 {
-			// Esc: if we have results, go back to result list
 			if len(ps.results) > 0 {
 				ps.editing = false
 				ps.redraw()
 				return nil
 			}
-			return &ytdlp.Result{} // quit
+			return &ytdlp.Result{}
 		}
-		// Ignore escape sequences in edit mode
 		return nil
 	case key[0] == '\r' || key[0] == '\n':
 		go ps.doSearch()
 		return nil
-	case key[0] == 127 || key[0] == 8: // backspace
+	case key[0] == 127 || key[0] == 8:
 		if len(ps.input) > 0 {
 			ps.input = ps.input[:len(ps.input)-1]
 			ps.redraw()
 		}
 		return nil
-	case key[0] == 21: // ctrl-u: clear input
+	case key[0] == 21:
 		ps.input = nil
 		ps.redraw()
 		return nil
-	case key[0] >= 32 && key[0] < 127: // printable ASCII
+	case key[0] >= 32 && key[0] < 127:
 		ps.input = append(ps.input, key[0])
 		ps.redraw()
 		return nil
 	default:
-		// UTF-8 multibyte — append all bytes
 		if key[0] >= 0xC0 {
 			ps.input = append(ps.input, key...)
 			ps.redraw()
@@ -274,12 +265,10 @@ func handleSearchInput(ps *pickerState, key []byte) *ytdlp.Result {
 	}
 }
 
-// handleResultsInput handles keys when browsing results.
 func handleResultsInput(ps *pickerState, key []byte) (*ytdlp.Result, bool) {
 	ws := getWinsize(ps.fd)
 	visible := visibleEntries(int(ws.Row))
 
-	// Arrow keys
 	if len(key) >= 3 && key[0] == 0x1b && key[1] == '[' {
 		switch key[2] {
 		case 'A':
@@ -299,9 +288,7 @@ func handleResultsInput(ps *pickerState, key []byte) (*ytdlp.Result, bool) {
 	}
 
 	switch key[0] {
-	case 'q', 3: // q or ctrl-c
-		return nil, true
-	case 0x1b: // bare esc
+	case 'q', 3, 0x1b:
 		return nil, true
 	case '\r', '\n':
 		if len(ps.results) > 0 {
@@ -371,11 +358,7 @@ func drawPicker(ps *pickerState) {
 	buf.WriteString("\x1b[?2026h")
 	buf.WriteString("\x1b[2J\x1b[H")
 
-	// Search bar
-	searchW := tw - 6
-	if searchW < 10 {
-		searchW = 10
-	}
+	searchW := max(tw-6, 10)
 	inputStr := string(ps.input)
 	displayInput := inputStr
 	if len(displayInput) > searchW-2 {
@@ -383,7 +366,6 @@ func drawPicker(ps *pickerState) {
 	}
 
 	if ps.editing {
-		// Show cursor in search bar
 		fmt.Fprintf(&buf, "\x1b[1;3H\x1b[1m\uf002 \x1b[0m\x1b[4m%-*s\x1b[0m", searchW, displayInput+"_")
 	} else {
 		if len(inputStr) > 0 {
@@ -401,15 +383,11 @@ func drawPicker(ps *pickerState) {
 		fmt.Fprintf(&buf, "\x1b[2;3H\x1b[2mNo results found.\x1b[0m")
 	}
 
-	// Results
 	if len(ps.results) > 0 {
 		end := min(offset+visible, len(ps.results))
 
 		textCol := 3 + thumbCols + 2
-		maxTextW := tw - textCol - 2
-		if maxTextW < 10 {
-			maxTextW = 10
-		}
+		maxTextW := max(tw-textCol-2, 10)
 
 		for i := 0; i < visible && offset+i < len(ps.results); i++ {
 			idx := offset + i
@@ -470,7 +448,6 @@ func drawPicker(ps *pickerState) {
 		}
 	}
 
-	// Footer
 	if ps.editing {
 		fmt.Fprintf(&buf, "\x1b[%d;3H\x1b[2m[enter] search  [esc] back  [ctrl+c] quit\x1b[0m", th-1)
 	} else {

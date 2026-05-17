@@ -8,14 +8,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
-	"unsafe"
 
+	"github.com/ebitengine/oto/v3"
 	"golang.org/x/term"
 )
 
@@ -39,54 +38,50 @@ type player struct {
 	ttyFd    int
 	oldState *term.State
 
-	vw, vh int // video decode dimensions
-	srcW, srcH int // source video dimensions (for aspect ratio)
+	vw, vh     int
+	srcW, srcH int
 
-	// Direct CDN URLs
 	videoURL  string
 	audioURL  string
 	sourceFPS float64
 
-	// Processes
 	mu      sync.Mutex
 	ffmpeg  *exec.Cmd
 	ffmpegA *exec.Cmd
-	aplay   *exec.Cmd
 	videoR  *os.File
 
-	// Audio sync: bytes pumped to audio player
+	otoCtx            *oto.Context
+	otoPlayer         *oto.Player
 	audioBytesWritten atomic.Int64
 	hasAudio          atomic.Bool
 
-	// Frame rendering — mmap'd file for zero-copy
 	framePath    string
 	framePathB64 string
 	frameFd      int
 	frameMmap    []byte
 	frameSize    int
 
-	// Async frame buffer: decoder goroutine fills, display loop drains
-	frameFull  chan []byte // decoded frames ready to display
-	frameEmpty chan []byte // recycled buffers for decoder to reuse
+	frameFull     chan []byte
+	frameEmpty    chan []byte
+	decoderDone   chan struct{}
+	decoderCancel context.CancelFunc
 
-	// Cached terminal size (updated on SIGWINCH)
 	tw, th       atomic.Int32
-	cellW, cellH atomic.Int64 // stored as fixed-point * 1000
+	cellW, cellH atomic.Int64 // fixed-point * 1000
 
-	quit      chan struct{}
-	position  float64 // seek offset
-	paused    atomic.Bool
-	seekCh    chan float64
-	qualityCh chan int
-	dirty     atomic.Bool
-	muted     atomic.Bool
-	looping   atomic.Bool
+	quit       chan struct{}
+	position   float64
+	paused     atomic.Bool
+	seekCh     chan float64
+	qualityCh  chan int
+	dirty      atomic.Bool
+	muted      atomic.Bool
+	looping    atomic.Bool
 	wantSearch atomic.Bool
 	scrubbing  atomic.Bool
-	scrubFrac  atomic.Int64 // position as fraction * 10000
-	buffered   atomic.Int64 // furthest decoded position in ms
+	scrubFrac  atomic.Int64 // fraction * 10000
+	buffered   atomic.Int64 // ms
 
-	// Reusable rendering state
 	drawBuf      bytes.Buffer
 	qualityLabel string
 	kittyHdr     string
@@ -97,12 +92,6 @@ type winsize struct {
 	Col    uint16
 	Xpixel uint16
 	Ypixel uint16
-}
-
-func getWinsize(fd int) winsize {
-	var ws winsize
-	_, _, _ = syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), syscall.TIOCGWINSZ, uintptr(unsafe.Pointer(&ws)))
-	return ws
 }
 
 func Run(cfg Config) error {
@@ -132,9 +121,9 @@ func Run(cfg Config) error {
 }
 
 func (p *player) init() error {
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	tty, err := openTTY()
 	if err != nil {
-		return fmt.Errorf("opening /dev/tty: %w", err)
+		return fmt.Errorf("opening tty: %w", err)
 	}
 	p.tty = tty
 	p.ttyFd = int(tty.Fd())
@@ -145,7 +134,6 @@ func (p *player) init() error {
 	}
 	p.oldState = oldState
 
-	// Alt screen, hide cursor, enable SGR mouse tracking (button-event mode)
 	_, _ = tty.WriteString("\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h")
 
 	p.updateWinsize()
@@ -169,6 +157,17 @@ func (p *player) init() error {
 	p.kittyHdr = fmt.Sprintf("\x1b_Ga=T,t=f,f=24,s=%d,v=%d,", p.vw, p.vh)
 	p.qualityLabel = fmt.Sprintf("%dp", p.vh)
 
+	otoCtx, ready, err := oto.NewContext(&oto.NewContextOptions{
+		SampleRate:   48000,
+		ChannelCount: 2,
+		Format:       oto.FormatSignedInt16LE,
+	})
+	if err != nil {
+		return fmt.Errorf("init audio context: %w", err)
+	}
+	<-ready
+	p.otoCtx = otoCtx
+
 	p.writeMessage("Buffering...")
 
 	if err := p.startAt(0); err != nil {
@@ -177,13 +176,7 @@ func (p *player) init() error {
 
 	go p.handleKeys()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGWINCH)
-	go func() {
-		for range sigCh {
-			p.updateWinsize()
-		}
-	}()
+	watchResize(p.ctx, p.updateWinsize)
 
 	return nil
 }
@@ -254,9 +247,10 @@ func (p *player) drainFrameQueue() {
 	}
 }
 
-// decoderLoop reads frames from ffmpeg as fast as it produces them,
-// filling the frame queue so playback can buffer ahead.
-func (p *player) decoderLoop(vr *os.File, startOffset float64) {
+// decoderLoop reads frames from ffmpeg as fast as it produces them.
+// Closes done on exit. Cancels via ctx for safe shutdown when stuck on channels.
+func (p *player) decoderLoop(ctx context.Context, vr *os.File, startOffset float64, done chan struct{}) {
+	defer close(done)
 	var n int64
 	for {
 		var buf []byte
@@ -265,6 +259,8 @@ func (p *player) decoderLoop(vr *os.File, startOffset float64) {
 			if buf == nil {
 				continue
 			}
+		case <-ctx.Done():
+			return
 		case <-p.quit:
 			return
 		}
@@ -272,7 +268,6 @@ func (p *player) decoderLoop(vr *os.File, startOffset float64) {
 		_, err := io.ReadFull(vr, buf)
 		if err != nil {
 			p.frameEmpty <- buf
-			// Send nil sentinel to signal EOF (don't close/recreate the channel)
 			select {
 			case p.frameFull <- nil:
 			default:
@@ -286,6 +281,9 @@ func (p *player) decoderLoop(vr *os.File, startOffset float64) {
 
 		select {
 		case p.frameFull <- buf:
+		case <-ctx.Done():
+			p.frameEmpty <- buf
+			return
 		case <-p.quit:
 			p.frameEmpty <- buf
 			return
@@ -294,14 +292,11 @@ func (p *player) decoderLoop(vr *os.File, startOffset float64) {
 }
 
 func (p *player) resolveURLs() error {
-	// Always fetch the best available quality. Downscaling to the target
-	// resolution is handled by ffmpeg, so the stream quality doesn't need
-	// to match the decode dimensions. This also avoids issues with
-	// portrait/Shorts videos where height/width filters pick wrong streams.
+	// Fetch best available quality; ffmpeg handles downscaling.
+	// Avoids height/width filter pitfalls for portrait/Shorts.
 	format := "bestvideo+bestaudio/best"
 	videoFmt := "bestvideo/best"
 
-	// Resolve URLs and video info in parallel
 	type result struct {
 		urls string
 		info string
@@ -367,9 +362,8 @@ func (p *player) resolveURLs() error {
 	return nil
 }
 
-// startAt launches video ffmpeg first. Audio pipeline is started later
-// by startAudio() when the first video frame is decoded, ensuring
-// audio never plays before video is visible.
+// startAt launches the video ffmpeg pipeline at offset seconds.
+// Audio is launched separately when the first video frame arrives.
 func (p *player) startAt(offset float64) error {
 	p.stopProcesses()
 
@@ -382,17 +376,14 @@ func (p *player) startAt(offset float64) error {
 
 	ssArg := fmt.Sprintf("%.1f", offset)
 
-	// --- Video pipeline only ---
 	videoR, videoW, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("creating video pipe: %w", err)
 	}
-	// Allow ffmpeg to decode ahead by giving the pipe room for multiple frames
 	setPipeSize(videoR, p.frameSize*8)
 
 	ffmpeg := exec.CommandContext(p.ctx, "ffmpeg",
 		"-y", "-hide_banner", "-loglevel", "error",
-		// Low-latency flags for faster startup
 		"-probesize", "100000",
 		"-analyzeduration", "500000",
 		"-fflags", "+nobuffer+fastseek+flush_packets",
@@ -402,7 +393,6 @@ func (p *player) startAt(offset float64) error {
 		"-an", "-map", "0:v:0",
 		"-vf", fmt.Sprintf("scale=%d:%d", p.vw, p.vh),
 		"-pix_fmt", "rgb24",
-		// CFR with explicit FPS so frame counting is accurate
 		"-fps_mode", "cfr",
 		"-r", fmt.Sprintf("%.2f", p.sourceFPS),
 		"-f", "rawvideo", "pipe:1",
@@ -425,17 +415,40 @@ func (p *player) startAt(offset float64) error {
 	p.buffered.Store(int64(offset * 1000))
 	p.mu.Unlock()
 
-	// Drain old frame queue and start decoder goroutine
+	// Cancel old decoder and wait for it to release buffers before draining.
+	if p.decoderCancel != nil {
+		p.decoderCancel()
+	}
+	if p.decoderDone != nil {
+		<-p.decoderDone
+	}
 	p.drainFrameQueue()
-	go p.decoderLoop(videoR, offset)
+	done := make(chan struct{})
+	p.decoderDone = done
+	decoderCtx, cancel := context.WithCancel(p.ctx)
+	p.decoderCancel = cancel
+	go p.decoderLoop(decoderCtx, videoR, offset, done)
 
 	go func() { _ = ffmpeg.Wait() }()
 
 	return nil
 }
 
-// startAudio launches the audio ffmpeg + platform audio player pipeline.
-// Called when the first video frame is decoded so audio and video start together.
+type countingReader struct {
+	r       io.Reader
+	written *atomic.Int64
+}
+
+func (cr *countingReader) Read(b []byte) (int, error) {
+	n, err := cr.r.Read(b)
+	if n > 0 {
+		cr.written.Add(int64(n))
+	}
+	return n, err
+}
+
+// startAudio decodes audio with ffmpeg and pipes PCM to the native audio
+// backend via oto (CoreAudio on macOS, ALSA/PulseAudio on Linux).
 func (p *player) startAudio() {
 	ssArg := fmt.Sprintf("%.1f", p.position)
 
@@ -463,69 +476,22 @@ func (p *player) startAudio() {
 	}
 	audioW.Close()
 
-	// Create platform audio player with minimal pipe buffer
-	aplayR, aplayW, err := os.Pipe()
-	if err != nil {
-		go func() { _, _ = io.Copy(io.Discard, audioR); audioR.Close() }()
-		go func() { _ = ffmpegA.Wait() }()
-		p.mu.Lock()
-		p.ffmpegA = ffmpegA
-		p.mu.Unlock()
-		return
-	}
-
-	// Minimize OS pipe buffer for tighter sync
-	setPipeSize(aplayW, 4096)
-
-	playerBin, playerArgs := audioPlayerCmd()
-	aplayCmd := exec.CommandContext(p.ctx, playerBin, playerArgs...)
-	aplayCmd.Stdin = aplayR
-
-	if err := aplayCmd.Start(); err != nil {
-		aplayR.Close()
-		aplayW.Close()
-		go func() { _, _ = io.Copy(io.Discard, audioR); audioR.Close() }()
-		go func() { _ = ffmpegA.Wait() }()
-		p.mu.Lock()
-		p.ffmpegA = ffmpegA
-		p.mu.Unlock()
-		return
-	}
-	aplayR.Close()
-
-	// Audio pump: count bytes written for sync
 	p.audioBytesWritten.Store(0)
+	reader := &countingReader{r: audioR, written: &p.audioBytesWritten}
+
+	player := p.otoCtx.NewPlayer(reader)
+	if p.muted.Load() {
+		player.SetVolume(0)
+	}
+	player.Play()
+
 	p.hasAudio.Store(true)
-	go func() {
-		buf := make([]byte, 4096)
-		silence := make([]byte, 4096) // zero bytes = silence
-		for {
-			n, err := audioR.Read(buf)
-			if n > 0 {
-				var werr error
-				if p.muted.Load() {
-					_, werr = aplayW.Write(silence[:n])
-				} else {
-					_, werr = aplayW.Write(buf[:n])
-				}
-				if werr != nil {
-					break
-				}
-				p.audioBytesWritten.Add(int64(n))
-			}
-			if err != nil {
-				break
-			}
-		}
-		aplayW.Close()
-		audioR.Close()
-	}()
-	go func() { _ = aplayCmd.Wait() }()
-	go func() { _ = ffmpegA.Wait() }()
+
+	go func() { _ = ffmpegA.Wait(); audioR.Close() }()
 
 	p.mu.Lock()
 	p.ffmpegA = ffmpegA
-	p.aplay = aplayCmd
+	p.otoPlayer = player
 	p.mu.Unlock()
 }
 
@@ -533,7 +499,11 @@ func (p *player) stopProcesses() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for _, cmd := range []*exec.Cmd{p.aplay, p.ffmpegA, p.ffmpeg} {
+	if p.otoPlayer != nil {
+		p.otoPlayer.Pause()
+		p.otoPlayer = nil
+	}
+	for _, cmd := range []*exec.Cmd{p.ffmpegA, p.ffmpeg} {
 		if cmd != nil && cmd.Process != nil {
 			_ = cmd.Process.Signal(syscall.SIGCONT)
 			_ = cmd.Process.Kill()
@@ -541,7 +511,6 @@ func (p *player) stopProcesses() {
 	}
 	p.ffmpeg = nil
 	p.ffmpegA = nil
-	p.aplay = nil
 
 	if p.videoR != nil {
 		p.videoR.Close()
@@ -556,34 +525,41 @@ func (p *player) stopAudioOnly() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	for _, cmd := range []*exec.Cmd{p.aplay, p.ffmpegA} {
-		if cmd != nil && cmd.Process != nil {
-			_ = cmd.Process.Signal(syscall.SIGCONT)
-			_ = cmd.Process.Kill()
-		}
+	if p.otoPlayer != nil {
+		p.otoPlayer.Pause()
+		p.otoPlayer = nil
+	}
+	if p.ffmpegA != nil && p.ffmpegA.Process != nil {
+		_ = p.ffmpegA.Process.Signal(syscall.SIGCONT)
+		_ = p.ffmpegA.Process.Kill()
 	}
 	p.ffmpegA = nil
-	p.aplay = nil
 	p.audioBytesWritten.Store(0)
 	p.hasAudio.Store(false)
 }
 
 const audioBytesPerSec = 48000 * 2 * 2 // 48kHz, 16-bit, stereo
 
+// audioPosSeconds returns seconds of audio actually played by the device.
+// Uses bytes oto has read from us minus bytes still in oto's internal buffer.
 func (p *player) audioPosSeconds() float64 {
-	raw := float64(p.audioBytesWritten.Load()) / float64(audioBytesPerSec)
-	adj := raw - platformAudioLatency
-	if adj < 0 {
+	written := p.audioBytesWritten.Load()
+	var buffered int
+	if p.otoPlayer != nil {
+		buffered = p.otoPlayer.BufferedSize()
+	}
+	played := written - int64(buffered)
+	if played < 0 {
 		return 0
 	}
-	return adj
+	return float64(played) / float64(audioBytesPerSec)
 }
 
 func (p *player) loop() error {
 	var frameCount int64
 	audioStarted := false
 	var syncStart time.Time
-	eofCount := 0 // consecutive nil frames received
+	eofCount := 0
 
 	reset := func() {
 		frameCount = 0
@@ -592,7 +568,6 @@ func (p *player) loop() error {
 	}
 
 	for {
-		// Priority checks: quit > quality > seek
 		select {
 		case <-p.quit:
 			return nil
@@ -613,7 +588,6 @@ func (p *player) loop() error {
 			bufEnd := float64(p.buffered.Load()) / 1000.0
 
 			if pos > current && pos < bufEnd-0.5 && audioStarted {
-				// Seek is within the buffer: skip frames instead of restarting
 				framesToSkip := int((pos - current) * p.sourceFPS)
 				for range framesToSkip {
 					select {
@@ -641,14 +615,12 @@ func (p *player) loop() error {
 		default:
 		}
 
-		// Pause: keep displaying last frame, let buffer fill
 		if p.paused.Load() {
 			p.displayFrame()
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
-		// Try to read next frame (non-blocking)
 		var frame []byte
 		select {
 		case f := <-p.frameFull:
@@ -656,28 +628,24 @@ func (p *player) loop() error {
 		case <-p.quit:
 			return nil
 		default:
-			// No frame ready yet, spin back to check pause/seek/quit
 			time.Sleep(5 * time.Millisecond)
 			continue
 		}
 
-		// nil means decoder hit an error (EOF, pipe closed by seek, etc.)
-		// Loop back to let the seek/quality handlers at the top process it.
-		// Only treat as true EOF after several consecutive nils with no pending actions.
+		// nil = decoder EOF or pipe closed by seek. Debounce: real EOF only
+		// after several consecutive nils with no pending seek/quality.
 		if frame == nil {
 			eofCount++
 			if eofCount < 3 {
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
-			// Check looping
 			if p.looping.Load() {
 				if p.startAt(0) == nil {
 					reset()
 					continue
 				}
 			}
-			// True EOF
 			p.writeMessage("Playback finished. [r] replay  [/] search  [q] quit")
 			for {
 				select {
@@ -693,7 +661,7 @@ func (p *player) loop() error {
 				default:
 				}
 				if eofCount == 0 {
-					break // was restarted
+					break
 				}
 				if p.looping.Load() {
 					p.looping.Store(false)
@@ -717,7 +685,6 @@ func (p *player) loop() error {
 			audioStarted = true
 		}
 
-		// Check pause before sync sleep
 		if p.paused.Load() {
 			copy(p.frameMmap, frame)
 			p.frameEmpty <- frame
@@ -726,7 +693,6 @@ func (p *player) loop() error {
 			continue
 		}
 
-		// Sync to audio or wall clock
 		videoPos := float64(frameCount) / p.sourceFPS
 		if p.hasAudio.Load() {
 			audioPos := p.audioPosSeconds()
@@ -763,10 +729,8 @@ func (p *player) displayFrame() {
 	buf := &p.drawBuf
 	buf.Reset()
 
-	// Begin synchronized update
 	buf.WriteString("\x1b[?2026h")
 
-	// On resize: delete old kitty placements and clear all text rows.
 	if p.dirty.CompareAndSwap(true, false) {
 		buf.WriteString("\x1b_Ga=d,d=a,q=2;\x1b\\")
 		for r := 1; r <= th; r++ {
@@ -774,12 +738,10 @@ func (p *player) displayFrame() {
 		}
 	}
 
-	// Cursor + kitty graphics
 	padLeft := max((tw-cols)/2, 0)
 	fmt.Fprintf(buf, "\x1b[1;%dH%sc=%d,r=%d,C=1,q=2;%s\x1b\\",
 		padLeft+1, p.kittyHdr, cols, rows, p.framePathB64)
 
-	// Progress bar (YouTube-style with position dot)
 	barRow := max(th-2, 1)
 	fmt.Fprintf(buf, "\x1b[%d;1H\x1b[2K", barRow)
 	scrubActive := p.scrubbing.Load()
@@ -789,16 +751,12 @@ func (p *player) displayFrame() {
 			playFrac := max(0.0, min(elapsed/p.cfg.Duration, 1.0))
 			bufFrac := max(0.0, min(float64(p.buffered.Load())/1000.0/p.cfg.Duration, 1.0))
 			pos := min(int(playFrac*float64(barW)), barW)
-			bufPos := min(int(bufFrac*float64(barW)), barW)
-			if bufPos < pos {
-				bufPos = pos
-			}
+			bufPos := max(min(int(bufFrac*float64(barW)), barW), pos)
 
 			if scrubActive {
 				scrubF := float64(p.scrubFrac.Load()) / 10000.0
 				scrubPos := min(int(scrubF*float64(barW)), barW)
 
-				// played | scrub preview | buffered | remaining
 				buf.WriteString(" ")
 				if scrubPos >= pos {
 					buf.WriteString("\x1b[31m")
@@ -824,7 +782,6 @@ func (p *player) displayFrame() {
 				}
 				buf.WriteString("\x1b[0m")
 			} else {
-				// played | dot | buffered | remaining
 				played := max(pos-1, 0)
 				buf.WriteString(" \x1b[31m")
 				buf.WriteString(strings.Repeat("\u2501", played))
@@ -842,19 +799,19 @@ func (p *player) displayFrame() {
 		}
 	}
 
-	// Info line
 	infoRow := max(th-1, 1)
 	fmt.Fprintf(buf, "\x1b[%d;1H\x1b[2K", infoRow)
 
-	icon := "\uf04c" // nf-fa-pause
+	// Nerd font glyphs: pause, play, mute, loop
+	icon := "\uf04c"
 	if p.paused.Load() {
-		icon = "\uf04b" // nf-fa-play
+		icon = "\uf04b"
 	}
 	if p.muted.Load() {
-		icon += " \uf026" // nf-fa-volume_off
+		icon += " \uf026"
 	}
 	if p.looping.Load() {
-		icon += " \uf01e" // nf-fa-repeat
+		icon += " \uf01e"
 	}
 
 	qualityLabel := p.qualityLabel
@@ -876,10 +833,8 @@ func (p *player) displayFrame() {
 	}
 	fmt.Fprintf(buf, " %s %s  \x1b[90m%s  %s\x1b[0m", icon, title, qualityLabel, timeStr)
 
-	// Controls
-	fmt.Fprintf(buf, "\x1b[%d;1H\x1b[2K \x1b[90m[space] pause  [←/→] seek  [m] mute  [r] loop  [1-4] quality  [/] search  [q] quit\x1b[0m", th)
+	fmt.Fprintf(buf, "\x1b[%d;1H\x1b[2K \x1b[90m[space] pause  [</>] seek  [m] mute  [r] loop  [1-4] quality  [/] search  [q] quit\x1b[0m", th)
 
-	// End synchronized update
 	buf.WriteString("\x1b[?2026l")
 
 	_, _ = syscall.Write(p.ttyFd, buf.Bytes())
@@ -921,7 +876,6 @@ func (p *player) handleKeys() {
 			return
 		}
 
-		// Prepend any carry from a previous partial read
 		var data []byte
 		if len(carry) > 0 {
 			data = append(carry, raw[:n]...)
@@ -935,14 +889,12 @@ func (p *player) handleKeys() {
 
 			if b == 0x1b {
 				if len(data) < 3 {
-					// Incomplete escape sequence, carry to next read
 					carry = append([]byte{}, data...)
 					data = nil
 					break
 				}
 
 				if data[1] == '[' && data[2] == '<' {
-					// SGR mouse event: find M or m terminator
 					end := -1
 					for i := 3; i < len(data); i++ {
 						if data[i] == 'M' || data[i] == 'm' {
@@ -951,7 +903,6 @@ func (p *player) handleKeys() {
 						}
 					}
 					if end < 0 {
-						// Incomplete mouse event, carry to next read
 						carry = append([]byte{}, data...)
 						data = nil
 						break
@@ -959,7 +910,6 @@ func (p *player) handleKeys() {
 					p.handleMouse(data[:end])
 					data = data[end:]
 				} else if data[1] == '[' {
-					// CSI sequence (arrow keys etc)
 					switch data[2] {
 					case 'C':
 						p.seekRelative(5)
@@ -970,23 +920,20 @@ func (p *player) handleKeys() {
 					case 'B':
 						p.seekRelative(-30)
 					}
-					// Skip to end of CSI: params are digits/semicolons, final byte is 0x40-0x7E
 					i := 2
 					for i < len(data) && ((data[i] >= '0' && data[i] <= '9') || data[i] == ';') {
 						i++
 					}
 					if i < len(data) {
-						i++ // consume final byte
+						i++
 					}
 					data = data[i:]
 				} else {
-					// Other escape (bare ESC etc), skip 1 byte
 					data = data[1:]
 				}
 				continue
 			}
 
-			// Single-byte key
 			data = data[1:]
 			if p.handleSingleKey(b) {
 				return
@@ -995,8 +942,7 @@ func (p *player) handleKeys() {
 	}
 }
 
-// handleSingleKey processes a single non-escape keypress. Returns true if the
-// key handler should exit (quit or back-to-search).
+// handleSingleKey returns true if the loop should exit (quit / back-to-search).
 func (p *player) handleSingleKey(b byte) bool {
 	switch b {
 	case 'q', 3:
@@ -1023,7 +969,15 @@ func (p *player) handleSingleKey(b byte) bool {
 	case 'k':
 		p.seekRelative(60)
 	case 'm':
-		p.muted.Store(!p.muted.Load())
+		nowMuted := !p.muted.Load()
+		p.muted.Store(nowMuted)
+		if p.otoPlayer != nil {
+			if nowMuted {
+				p.otoPlayer.SetVolume(0)
+			} else {
+				p.otoPlayer.SetVolume(1)
+			}
+		}
 	case 'r':
 		p.looping.Store(!p.looping.Load())
 	case '/':
@@ -1137,13 +1091,12 @@ func (p *player) handleMouse(data []byte) {
 	th := int(p.th.Load())
 	inBottomArea := row >= th-2
 
-	// Release on video area: toggle pause (using release avoids focus-click issues)
+	// Toggle on release, not press: avoids focus-click swallowing the event.
 	if btn == 0 && !inBottomArea && isRelease && !p.scrubbing.Load() {
 		p.togglePause()
 		return
 	}
 
-	// Everything below requires known duration and valid bar width
 	if p.cfg.Duration <= 0 {
 		return
 	}
@@ -1154,25 +1107,18 @@ func (p *player) handleMouse(data []byte) {
 	frac := max(0.0, min(1.0, float64(col-2)/float64(barW)))
 
 	switch {
-	// Scroll wheel: seek +-5s (ignore during scrub)
 	case (btn == 64 || btn == 65) && !p.scrubbing.Load():
 		if btn == 64 {
 			p.seekRelative(5)
 		} else {
 			p.seekRelative(-5)
 		}
-
-	// Release: stop scrubbing, seek to final position
 	case isRelease && p.scrubbing.Load():
 		p.scrubbing.Store(false)
 		p.seekAbsolute(frac * p.cfg.Duration)
-
-	// Left click in bottom area: start scrub preview (seek happens on release)
 	case btn == 0 && inBottomArea && !isRelease:
 		p.scrubbing.Store(true)
 		p.scrubFrac.Store(int64(frac * 10000))
-
-	// Drag while scrubbing: update preview position
 	case btn == 32 && p.scrubbing.Load():
 		p.scrubFrac.Store(int64(frac * 10000))
 	}
@@ -1181,10 +1127,9 @@ func (p *player) handleMouse(data []byte) {
 func (p *player) requestQuality(maxHeight int) {
 	newW, newH := p.scaledSize(maxHeight)
 	if newW == p.vw && newH == p.vh {
-		return // already at this quality
+		return
 	}
 
-	// Get current position for seamless restart
 	p.mu.Lock()
 	if p.paused.Load() {
 		p.paused.Store(false)
@@ -1202,7 +1147,6 @@ func (p *player) requestQuality(maxHeight int) {
 }
 
 func (p *player) changeQuality(maxHeight int) error {
-	// Calculate current playback position before stopping
 	var currentPos float64
 	if p.hasAudio.Load() {
 		currentPos = p.position + p.audioPosSeconds()
@@ -1213,10 +1157,12 @@ func (p *player) changeQuality(maxHeight int) error {
 	p.stopProcesses()
 	p.cfg.MaxHeight = maxHeight
 
-	// Show status in the controls row without clearing the frame
 	th := int(p.th.Load())
-	msg := fmt.Sprintf("Switching to %dp...", maxHeight)
-	_, _ = syscall.Write(p.ttyFd, []byte(fmt.Sprintf("\x1b[%d;1H\x1b[2K \x1b[33m%s\x1b[0m", th, msg)))
+	msg := fmt.Appendf(nil, "\x1b[%d;1H\x1b[2K \x1b[33mSwitching to %dp...\x1b[0m", th, maxHeight)
+	_, _ = syscall.Write(p.ttyFd, msg)
+	if err := p.resolveURLs(); err != nil {
+		return fmt.Errorf("resolving URLs for %dp: %w", maxHeight, err)
+	}
 	if err := p.resolveURLs(); err != nil {
 		return fmt.Errorf("resolving URLs for %dp: %w", maxHeight, err)
 	}
@@ -1241,18 +1187,20 @@ func (p *player) togglePause() {
 	defer p.mu.Unlock()
 
 	if p.paused.Load() {
-		for _, cmd := range []*exec.Cmd{p.ffmpegA, p.aplay} {
-			if cmd != nil && cmd.Process != nil {
-				_ = cmd.Process.Signal(syscall.SIGCONT)
-			}
+		if p.otoPlayer != nil {
+			p.otoPlayer.Play()
+		}
+		if p.ffmpegA != nil && p.ffmpegA.Process != nil {
+			_ = p.ffmpegA.Process.Signal(syscall.SIGCONT)
 		}
 		p.paused.Store(false)
 	} else {
 		p.paused.Store(true)
-		for _, cmd := range []*exec.Cmd{p.ffmpegA, p.aplay} {
-			if cmd != nil && cmd.Process != nil {
-				_ = cmd.Process.Signal(syscall.SIGSTOP)
-			}
+		if p.otoPlayer != nil {
+			p.otoPlayer.Pause()
+		}
+		if p.ffmpegA != nil && p.ffmpegA.Process != nil {
+			_ = p.ffmpegA.Process.Signal(syscall.SIGSTOP)
 		}
 	}
 }
@@ -1303,9 +1251,8 @@ func (p *player) cleanup() {
 
 }
 
-// scaledSize computes decode dimensions preserving the source aspect ratio.
-// Height is clamped to maxHeight; width is derived from the source ratio
-// and rounded to even (ffmpeg requirement).
+// scaledSize returns decode dimensions preserving source aspect ratio,
+// height clamped to maxHeight, both rounded up to even for ffmpeg.
 func (p *player) scaledSize(maxHeight int) (int, int) {
 	sw, sh := p.srcW, p.srcH
 	if sw <= 0 || sh <= 0 {
@@ -1314,7 +1261,6 @@ func (p *player) scaledSize(maxHeight int) (int, int) {
 
 	h := min(sh, maxHeight)
 	w := int(float64(sw) / float64(sh) * float64(h))
-	// Round width to even for ffmpeg
 	w = (w + 1) &^ 1
 	h = (h + 1) &^ 1
 	if w < 2 {
