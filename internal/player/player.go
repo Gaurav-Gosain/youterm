@@ -21,6 +21,30 @@ import (
 // ErrBackToSearch is returned by Run when the user requests to go back to search.
 var ErrBackToSearch = fmt.Errorf("back to search")
 
+// oto.NewContext is a process-wide singleton; reuse across Run calls.
+var (
+	sharedOtoCtx    *oto.Context
+	sharedOtoOnce   sync.Once
+	sharedOtoErr    error
+)
+
+func ensureOtoContext() (*oto.Context, error) {
+	sharedOtoOnce.Do(func() {
+		ctx, ready, err := oto.NewContext(&oto.NewContextOptions{
+			SampleRate:   48000,
+			ChannelCount: 2,
+			Format:       oto.FormatSignedInt16LE,
+		})
+		if err != nil {
+			sharedOtoErr = err
+			return
+		}
+		<-ready
+		sharedOtoCtx = ctx
+	})
+	return sharedOtoCtx, sharedOtoErr
+}
+
 type Config struct {
 	URL       string
 	Title     string
@@ -157,15 +181,10 @@ func (p *player) init() error {
 	p.kittyHdr = fmt.Sprintf("\x1b_Ga=T,t=f,f=24,s=%d,v=%d,", p.vw, p.vh)
 	p.qualityLabel = fmt.Sprintf("%dp", p.vh)
 
-	otoCtx, ready, err := oto.NewContext(&oto.NewContextOptions{
-		SampleRate:   48000,
-		ChannelCount: 2,
-		Format:       oto.FormatSignedInt16LE,
-	})
+	otoCtx, err := ensureOtoContext()
 	if err != nil {
 		return fmt.Errorf("init audio context: %w", err)
 	}
-	<-ready
 	p.otoCtx = otoCtx
 
 	p.writeMessage("Buffering...")

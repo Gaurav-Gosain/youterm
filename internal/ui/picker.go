@@ -127,17 +127,19 @@ func (ps *pickerState) doSearch() {
 
 // Pick shows an interactive picker. If initialResults is empty, it starts
 // in search-input mode. searchCount sets the yt-dlp result limit.
-func Pick(initialResults []ytdlp.Result, searchCount int) (*ytdlp.Result, error) {
+// Returns the chosen entry and the final results list (which may differ
+// from initialResults if the user ran a new search inside the picker).
+func Pick(initialResults []ytdlp.Result, searchCount int) (*ytdlp.Result, []ytdlp.Result, error) {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer tty.Close()
 
 	fd := int(tty.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer term.Restore(fd, oldState)
 
@@ -212,12 +214,12 @@ func Pick(initialResults []ytdlp.Result, searchCount int) (*ytdlp.Result, error)
 			if ps.editing {
 				result := handleSearchInput(ps, key)
 				if result != nil {
-					return result, nil
+					return result, ps.results, nil
 				}
 			} else {
 				result, done := handleResultsInput(ps, key)
 				if done {
-					return result, nil
+					return result, ps.results, nil
 				}
 			}
 		}

@@ -38,36 +38,35 @@ Controls:
 	flag.Parse()
 
 	query := strings.Join(flag.Args(), " ")
+	var cachedResults []ytdlp.Result
 
 	for {
 		var videoURL, title string
 		var duration float64
 
-		if query != "" && isURL(query) {
-			// Direct URL mode
+		switch {
+		case query != "" && isURL(query):
 			videoURL = query
 			if !*useMpv {
 				fmt.Fprintf(os.Stderr, "Resolving metadata...\n")
-				info, err := ytdlp.GetMetadata(query)
-				if err == nil {
+				if info, err := ytdlp.GetMetadata(query); err == nil {
 					title = info.Title
 					duration = info.Duration
 				}
 			}
-		} else {
-			// Search mode: pass initial results if we have a query, otherwise empty
-			var initialResults []ytdlp.Result
-			if query != "" {
+		default:
+			results := cachedResults
+			if results == nil && query != "" {
 				fmt.Fprintf(os.Stderr, "Searching...\n")
-				results, err := ytdlp.Search(query, *count)
+				r, err := ytdlp.Search(query, *count)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Search error: %v\n", err)
 					os.Exit(1)
 				}
-				initialResults = results
+				results = r
 			}
 
-			chosen, err := ui.Pick(initialResults, *count)
+			chosen, finalResults, err := ui.Pick(results, *count)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
@@ -76,6 +75,7 @@ Controls:
 				return
 			}
 
+			cachedResults = finalResults
 			videoURL = chosen.URL
 			title = chosen.Title
 			duration = chosen.Duration
@@ -95,7 +95,7 @@ Controls:
 		}
 
 		if errors.Is(err, player.ErrBackToSearch) {
-			query = "" // go to picker with empty search bar
+			query = ""
 			continue
 		}
 		if err != nil {
