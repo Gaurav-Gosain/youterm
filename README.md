@@ -109,6 +109,7 @@ youterm --mpv https://www.youtube.com/watch?v=dQw4w9WgXcQ
 |-----|--------|
 | `Space` | Pause / resume |
 | Click on video | Pause / resume |
+| `f` / Right-click | Hide / show bottom bar |
 | `Left` / `Right` | Seek -5s / +5s |
 | `h` / `l` | Seek -10s / +10s |
 | `Up` / `Down` | Seek +30s / -30s |

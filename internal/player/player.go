@@ -99,10 +99,11 @@ type player struct {
 	seekCh     chan float64
 	qualityCh  chan int
 	dirty      atomic.Bool
-	muted      atomic.Bool
-	looping    atomic.Bool
-	wantSearch atomic.Bool
-	scrubbing  atomic.Bool
+	muted        atomic.Bool
+	looping      atomic.Bool
+	wantSearch   atomic.Bool
+	scrubbing    atomic.Bool
+	chromeHidden atomic.Bool
 	scrubFrac  atomic.Int64 // fraction * 10000
 	buffered   atomic.Int64 // ms
 
@@ -738,8 +739,12 @@ func (p *player) loop() error {
 func (p *player) displayFrame() {
 	tw := int(p.tw.Load())
 	th := int(p.th.Load())
+	chromeHidden := p.chromeHidden.Load()
 
 	availRows := max(th-3, 1)
+	if chromeHidden {
+		availRows = max(th, 1)
+	}
 	cols, rows := p.fitImage(tw, availRows)
 
 	// Elapsed time from audio clock
@@ -760,6 +765,12 @@ func (p *player) displayFrame() {
 	padLeft := max((tw-cols)/2, 0)
 	fmt.Fprintf(buf, "\x1b[1;%dH%sc=%d,r=%d,C=1,q=2;%s\x1b\\",
 		padLeft+1, p.kittyHdr, cols, rows, p.framePathB64)
+
+	if chromeHidden {
+		buf.WriteString("\x1b[?2026l")
+		_, _ = syscall.Write(p.ttyFd, buf.Bytes())
+		return
+	}
 
 	barRow := max(th-2, 1)
 	fmt.Fprintf(buf, "\x1b[%d;1H\x1b[2K", barRow)
@@ -852,7 +863,7 @@ func (p *player) displayFrame() {
 	}
 	fmt.Fprintf(buf, " %s %s  \x1b[90m%s  %s\x1b[0m", icon, title, qualityLabel, timeStr)
 
-	fmt.Fprintf(buf, "\x1b[%d;1H\x1b[2K \x1b[90m[space] pause  [</>] seek  [m] mute  [r] loop  [1-4] quality  [/] search  [q] quit\x1b[0m", th)
+	fmt.Fprintf(buf, "\x1b[%d;1H\x1b[2K \x1b[90m[space] pause  [</>] seek  [m] mute  [r] loop  [f] hide bar  [1-4] quality  [/] search  [q] quit\x1b[0m", th)
 
 	buf.WriteString("\x1b[?2026l")
 
@@ -999,6 +1010,9 @@ func (p *player) handleSingleKey(b byte) bool {
 		}
 	case 'r':
 		p.looping.Store(!p.looping.Load())
+	case 'f':
+		p.chromeHidden.Store(!p.chromeHidden.Load())
+		p.dirty.Store(true)
 	case '/':
 		p.wantSearch.Store(true)
 		p.mu.Lock()
@@ -1108,7 +1122,14 @@ func (p *player) handleMouse(data []byte) {
 
 	tw := int(p.tw.Load())
 	th := int(p.th.Load())
-	inBottomArea := row >= th-2
+	chromeHidden := p.chromeHidden.Load()
+	inBottomArea := !chromeHidden && row >= th-2
+
+	if btn == 2 && isRelease {
+		p.chromeHidden.Store(!chromeHidden)
+		p.dirty.Store(true)
+		return
+	}
 
 	// Toggle on release, not press: avoids focus-click swallowing the event.
 	if btn == 0 && !inBottomArea && isRelease && !p.scrubbing.Load() {
